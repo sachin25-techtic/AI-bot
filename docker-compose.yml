@@ -1,0 +1,29 @@
+services:
+  # Local LLM runtime. Exposes the Ollama HTTP API on http://localhost:11434
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aibot-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  # Postgres with the pgvector extension (used in phase 2 / RAG).
+  # Mapped to host port 5433 so it doesn't clash with a local Postgres on 5432.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aibot-postgres
+    environment:
+      POSTGRES_USER: aibot
+      POSTGRES_PASSWORD: aibot
+      POSTGRES_DB: aibot
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
+  pg-data:

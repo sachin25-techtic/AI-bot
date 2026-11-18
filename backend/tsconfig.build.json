@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Keep TypeScript's incremental-build cache inside dist/. Nest deletes dist/
+    // before each build (deleteOutDir); a cache left outside it makes TypeScript
+    // think nothing changed, so it emits no files and dist/main.js is missing.
+    "tsBuildInfoFile": "./dist/tsconfig.build.tsbuildinfo"
+  },
+  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+}
