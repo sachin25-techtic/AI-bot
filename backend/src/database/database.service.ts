@@ -29,7 +29,7 @@ const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS chunks (
     id          SERIAL PRIMARY KEY,
     document_id INT  NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    page        INT  NOT NULL,
+    page        INT,
     chunk_index INT  NOT NULL,
     content     TEXT NOT NULL,
     embedding   vector(${EMBEDDING_DIMENSIONS}) NOT NULL
@@ -39,6 +39,22 @@ const SCHEMA_SQL = `
   -- with many chunks. vector_cosine_ops = we compare by cosine distance (<=>).
   CREATE INDEX IF NOT EXISTS chunks_embedding_idx
     ON chunks USING hnsw (embedding vector_cosine_ops);
+
+  -- Added for DOCX / web pages and re-upload handling. "ADD COLUMN IF NOT
+  -- EXISTS" upgrades a database created by the earlier version in place.
+  ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_type  TEXT NOT NULL DEFAULT 'pdf'; -- pdf | docx | web
+  ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_url   TEXT;                        -- web pages only
+  -- What makes two uploads "the same document": the file name, or the URL.
+  ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_key   TEXT;
+  -- SHA-256 of the extracted text, to spot whether a re-upload actually changed.
+  ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash TEXT;
+  ALTER TABLE documents ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ NOT NULL DEFAULT now();
+  UPDATE documents SET source_key = filename WHERE source_key IS NULL;
+  ALTER TABLE documents ALTER COLUMN source_key SET NOT NULL;
+  CREATE INDEX IF NOT EXISTS documents_source_key_idx ON documents (source_key);
+
+  -- DOCX files and web pages have no page numbers.
+  ALTER TABLE chunks ALTER COLUMN page DROP NOT NULL;
 `;
 
 @Injectable()

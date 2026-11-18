@@ -4,6 +4,8 @@ import {
   Delete,
   Get,
   HttpCode,
+  HttpException,
+  Logger,
   Param,
   Post,
   Res,
@@ -13,27 +15,50 @@ import { ChatService } from './chat.service';
 import { ChatRequestDto } from './dto/chat-request.dto';
 
 /**
- * POST /api/chat streams the answer back as NDJSON (one JSON object per line):
+ * POST /api/chat streams the answer back as SERVER-SENT EVENTS (SSE).
  *
- *   {"type":"meta","conversationId":"..."}
- *   {"type":"sources","sources":[...]}      (only when useDocuments is true)
- *   {"type":"token","content":"Hel"}
- *   {"type":"token","content":"lo!"}
- *   {"type":"done"}
+ * SSE is a simple text format over a normal HTTP response
+ * (Content-Type: text/event-stream). Each event is an `event:` line naming
+ * its type, a `data:` line with JSON, and a blank line to end the event:
  *
- * or {"type":"error","message":"..."} if something goes wrong mid-stream.
+ *   event: meta
+ *   data: {"conversationId":"..."}
+ *
+ *   event: sources                      (only when useDocuments is true)
+ *   data: {"sources":[...]}
+ *
+ *   event: token
+ *   data: {"content":"Hel"}
+ *
+ *   event: token
+ *   data: {"content":"lo!"}
+ *
+ *   event: done
+ *   data: {}
+ *
+ * or `event: error` / `data: {"message":"..."}` if something goes wrong mid-stream.
+ *
+ * (The browser's built-in EventSource only supports GET, so the frontend reads
+ * this stream with fetch() and a small parser. The format is the same.)
  */
 @Controller('chat')
 export class ChatController {
+  private readonly logger = new Logger(ChatController.name);
+
   constructor(private readonly chat: ChatService) {}
 
   @Post()
   async send(@Body() body: ChatRequestDto, @Res() res: Response) {
     const conversationId = this.chat.resolveConversation(body.conversationId);
 
-    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    const send = (event: object) => res.write(JSON.stringify(event) + '\n');
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // stop proxies like nginx buffering the stream
+    res.flushHeaders();
+
+    const send = (event: string, data: object = {}) =>
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
     // If the browser disconnects (user pressed Stop), cancel the Ollama request too.
     const abort = new AbortController();
@@ -41,24 +66,21 @@ export class ChatController {
       if (!res.writableEnded) abort.abort();
     });
 
-    send({ type: 'meta', conversationId });
+    send('meta', { conversationId });
     try {
-      // Events are {type:'sources'} (RAG only, sent first) and {type:'token'}.
-      for await (const event of this.chat.reply(
-        conversationId,
-        body.message,
-        body.useDocuments ?? false,
-        abort.signal,
-      )) {
-        send(event);
+      for await (const event of this.chat.reply(conversationId, body.message, {
+        useDocuments: body.useDocuments ?? false,
+        temperature: body.temperature,
+        signal: abort.signal,
+      })) {
+        if (event.type === 'sources')
+          send('sources', { sources: event.sources });
+        else send('token', { content: event.content });
       }
-      send({ type: 'done' });
+      send('done');
     } catch (err) {
       if (!abort.signal.aborted) {
-        send({
-          type: 'error',
-          message: err instanceof Error ? err.message : String(err),
-        });
+        send('error', { message: friendlyMessage(err, this.logger) });
       }
     } finally {
       res.end();
@@ -75,4 +97,26 @@ export class ChatController {
   reset(@Param('conversationId') conversationId: string) {
     this.chat.reset(conversationId);
   }
+}
+
+/**
+ * Errors we raise on purpose (OllamaError and other HttpExceptions) already
+ * carry a message meant for users. Anything else is a bug or an outage we
+ * didn't anticipate: log the details, show a generic message.
+ */
+function friendlyMessage(err: unknown, logger: Logger): string {
+  if (err instanceof HttpException) return err.message;
+  logger.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+  if (isConnectionRefused(err)) {
+    return 'The database isn\'t reachable. Start it with "docker compose up -d".';
+  }
+  return 'Something went wrong while answering. Please try again.';
+}
+
+function isConnectionRefused(err: unknown): boolean {
+  const e = err as { code?: string; errors?: { code?: string }[] };
+  return (
+    e?.code === 'ECONNREFUSED' ||
+    (e?.errors ?? []).some((x) => x.code === 'ECONNREFUSED')
+  );
 }

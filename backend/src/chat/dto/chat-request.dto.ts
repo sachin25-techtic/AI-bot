@@ -1,10 +1,13 @@
 import {
   IsBoolean,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
+  Max,
   MaxLength,
+  Min,
 } from 'class-validator';
 
 export class ChatRequestDto {
@@ -18,8 +21,15 @@ export class ChatRequestDto {
   @MaxLength(8000)
   message!: string;
 
-  /** (Phase 2) Answer from uploaded PDFs, with citations. */
+  /** (Phase 2) Answer from uploaded documents, with citations. */
   @IsOptional()
   @IsBoolean()
   useDocuments?: boolean;
+
+  /** 0 = predictable, higher = more random. Omit for the default (0.7 chat, 0.1 documents). */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(2)
+  temperature?: number;
 }

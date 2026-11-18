@@ -1,7 +1,8 @@
 import { PDFParse } from 'pdf-parse';
 
 export interface PageText {
-  page: number; // 1-based page number, used for citations
+  /** 1-based page number used for citations. null when the format has no pages (DOCX, web). */
+  page: number | null;
   text: string;
 }
 
@@ -27,7 +28,7 @@ export async function extractPdfPages(data: Buffer): Promise<PageText[]> {
   }
 }
 
-function normalizeWhitespace(text: string): string {
+export function normalizeWhitespace(text: string): string {
   return text
     .replace(/[ \t]+/g, ' ') // collapse runs of spaces
     .replace(/\n{3,}/g, '\n\n') // at most one blank line
