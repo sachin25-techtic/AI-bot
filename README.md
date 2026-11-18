@@ -6,6 +6,8 @@ A local chatbot built in two phases:
    Ollama's **OpenAI-compatible API**. Replies stream word by word over **server-sent events**. A
    **"Summarise text"** button returns **schema-validated JSON** (title, summary, three keywords), and
    invalid JSON is retried. Timeouts, retries and an Ollama that isn't running all give friendly errors.
+   **Chat history works like ChatGPT**: chats are saved in Postgres, listed in a sidebar, named by the
+   LLM, and each one has its own URL.
 2. **RAG (weeks 2–3).** Add PDFs, Word files or web pages. The app extracts the text, chunks it, embeds
    it with `nomic-embed-text`, stores it in pgvector, retrieves the relevant chunks for each question
    and answers with citations like `[1]` that show the document and page. If nothing relevant is
@@ -94,7 +96,26 @@ All settings (model, temperature, timeouts, relevance threshold) are in [backend
    data: {"content":"Your"}
    ```
    React appends it to the bubble.
-5. When the reply is finished, NestJS saves the question and the answer to the history.
+5. When the reply is finished, NestJS saves the question and the answer to Postgres and sends `event: done`.
+6. For a new chat it then asks the LLM for a short title and sends `event: title`.
+
+### Chat history (like ChatGPT)
+
+| Piece | Where |
+| --- | --- |
+| Tables `conversations` and `messages` | [database.service.ts](backend/src/database/database.service.ts) |
+| Saving and loading chats | [conversation.store.ts](backend/src/chat/conversation.store.ts) |
+| Sidebar API: list, open, rename, delete | [conversations.controller.ts](backend/src/chat/conversations.controller.ts) |
+| AI-generated titles | `generateTitleIfNeeded()` in [chat.service.ts](backend/src/chat/chat.service.ts) |
+| Sidebar UI: grouped by date, search, rename, delete | [ChatSidebar.tsx](frontend/src/components/ChatSidebar.tsx) |
+| URLs `/` (new chat) and `/c/<id>` | [app/[[...slug]]/page.tsx](frontend/src/app/[[...slug]]/page.tsx), `openConversation()` in [Chat.tsx](frontend/src/components/Chat.tsx) |
+
+- A chat is created by its first message. Until the first answer is saved, it's titled with the start of the question.
+  The LLM then names it (structured output, validated like the summaries). A name you choose with rename is never overwritten.
+- A question and its answer are saved together, in one transaction, only when the answer is complete.
+  A stopped or failed turn is not saved. A chat whose very first answer failed is never listed, and it's cleaned up after a day.
+- The model still sees only the last 20 messages (the context window), but the sidebar keeps everything.
+- Switching chats while an answer is streaming cancels that answer, like pressing Stop.
 
 ### Structured output: the "Summarise text" button
 
@@ -202,7 +223,7 @@ pages either, so their citations show the document name (and a link for web page
 
 ## Limitations (kept simple on purpose)
 
-- Conversation history is stored in memory and lost when the backend restarts. Documents persist in Postgres.
+- One shared chat history: there are no user accounts, so everyone using this backend sees the same chats.
 - Scanned PDFs have no text layer and would need OCR first.
 - Adding a document embeds it before responding, so very large documents make the request slow.
   A real app would process uploads in a background job.
@@ -214,9 +235,11 @@ pages either, so their citations show the document name (and a link for web page
 
 | Method | Path | Body / notes |
 | --- | --- | --- |
-| POST | `/api/chat` | `{ message, conversationId?, useDocuments?, temperature? }` → SSE stream of `meta`, `sources`, `token`, `done` / `error` events |
-| GET | `/api/chat/:conversationId` | Stored history |
-| DELETE | `/api/chat/:conversationId` | Forget a conversation |
+| POST | `/api/chat` | `{ message, conversationId?, useDocuments?, temperature? }` → SSE stream of `meta`, `sources`, `token`, `done`, `title` / `error` events. Omit `conversationId` to start a new chat |
+| GET | `/api/conversations` | Saved chats, most recent first: `[{ id, title, createdAt, updatedAt }]` |
+| GET | `/api/conversations/:id` | One chat with its `messages` (including the `sources` of RAG answers) |
+| PATCH | `/api/conversations/:id` | `{ title }`: rename |
+| DELETE | `/api/conversations/:id` | Delete a chat and its messages |
 | POST | `/api/summarise` | `{ text }` (50–20,000 chars) → `{ summary: { title, summary, keywords[3] }, attempts }` |
 | GET | `/api/health` | `{ ok, problems[], ollama, database, models }` |
 | POST | `/api/documents` | multipart `file` (PDF or DOCX, max 25 MB) → document + `status`: `created` / `updated` / `unchanged` |

@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { z } from 'zod';
 import { DocumentsService, Source } from '../documents/documents.service';
 import { ChatMessage, OllamaService } from '../ollama/ollama.service';
-import { ConversationStore, StoredMessage } from './conversation.store';
+import { ConversationStore } from './conversation.store';
 
 const SYSTEM_PROMPT =
   'You are a helpful, friendly assistant. Answer clearly and concisely.';
@@ -42,6 +43,19 @@ const MAX_SCORE_GAP_FROM_BEST = 0.15;
  */
 const RAG_TEMPERATURE = 0.1;
 
+/** What a generated chat title must look like (validated, like the summaries). */
+const TitleSchema = z.object({
+  title: z.string().trim().min(2).max(80).describe('A 3 to 6 word title'),
+});
+const TITLE_JSON_SCHEMA = z.toJSONSchema(TitleSchema) as Record<
+  string,
+  unknown
+>;
+
+const TITLE_PROMPT = `Write a short title (3 to 6 words) for the conversation below, like a chat app's sidebar title.
+Describe the topic. No quotes, no emoji, no full stop at the end.
+Reply with only JSON: {"title": "..."}`;
+
 export type ChatStreamEvent =
   { type: 'sources'; sources: Source[] } | { type: 'token'; content: string };
 
@@ -53,6 +67,8 @@ export interface ReplyOptions {
 
 @Injectable()
 export class ChatService {
+  private readonly logger = new Logger(ChatService.name);
+
   /**
    * Minimum similarity (0–1) for a chunk to count as relevant at all.
    * Measured with nomic-embed-text on the sample documents: questions the
@@ -70,18 +86,62 @@ export class ChatService {
     this.minScore = Number(config.get('RAG_MIN_SCORE', 0.6));
   }
 
-  /** Returns an existing conversation id, or creates a new conversation. */
-  resolveConversation(conversationId?: string): string {
-    if (conversationId && this.store.has(conversationId)) return conversationId;
-    return this.store.create();
+  /**
+   * Returns the conversation to continue, or starts a new one (no id given,
+   * or the id no longer exists because the chat was deleted).
+   */
+  async resolveConversation(
+    conversationId: string | undefined,
+    firstMessage: string,
+  ): Promise<string> {
+    if (conversationId && (await this.store.exists(conversationId))) {
+      return conversationId;
+    }
+    return this.store.create(firstMessage);
   }
 
-  getHistory(conversationId: string): StoredMessage[] {
-    return this.store.get(conversationId);
-  }
+  /**
+   * Like ChatGPT: after the first answer, ask the LLM for a short title that
+   * replaces the provisional one (the start of the first question).
+   * Returns the new title, or null if there was nothing to do or it failed.
+   * A failed attempt is simply tried again after the next message.
+   */
+  async generateTitleIfNeeded(conversationId: string): Promise<string | null> {
+    if (!(await this.store.needsTitle(conversationId))) return null;
+    const [question, answer] = await this.store.messages(conversationId);
+    if (!question || !answer) return null;
 
-  reset(conversationId: string): void {
-    this.store.delete(conversationId);
+    try {
+      const raw = await this.ollama.chatJson(
+        [
+          { role: 'system', content: TITLE_PROMPT },
+          {
+            role: 'user',
+            content:
+              `User: ${question.content.slice(0, 1000)}\n\n` +
+              `Assistant: ${answer.content.slice(0, 1000)}`,
+          },
+        ],
+        {
+          schema: TITLE_JSON_SCHEMA,
+          schemaName: 'chat_title',
+          temperature: 0.3,
+        },
+      );
+      const parsed = TitleSchema.safeParse(JSON.parse(raw));
+      if (!parsed.success) return null;
+      const title = parsed.data.title
+        .replace(/^["'“”]+|["'“”]+$/g, '') // models love wrapping titles in quotes
+        .replace(/[.!]+$/, '')
+        .trim();
+      if (!title) return null;
+      return (await this.store.setGeneratedTitle(conversationId, title))
+        ? title
+        : null;
+    } catch (err) {
+      this.logger.warn(`Couldn't generate a chat title: ${String(err)}`);
+      return null;
+    }
   }
 
   /**
@@ -96,7 +156,10 @@ export class ChatService {
     userMessage: string,
     { useDocuments, temperature, signal }: ReplyOptions,
   ): AsyncGenerator<ChatStreamEvent> {
-    const history = this.store.get(conversationId);
+    const history = await this.store.recentMessages(
+      conversationId,
+      MAX_HISTORY_MESSAGES,
+    );
 
     let systemPrompt = SYSTEM_PROMPT;
     let promptForModel = userMessage;
@@ -110,7 +173,12 @@ export class ChatService {
       // no useful sources is exactly when it would make something up.
       if (sources.length === 0) {
         yield { type: 'token', content: NOT_FOUND_MESSAGE };
-        this.saveTurn(conversationId, userMessage, NOT_FOUND_MESSAGE, sources);
+        await this.store.appendTurn(
+          conversationId,
+          userMessage,
+          NOT_FOUND_MESSAGE,
+          sources,
+        );
         return;
       }
 
@@ -122,9 +190,7 @@ export class ChatService {
     const messages: ChatMessage[] = [
       { role: 'system', content: systemPrompt },
       // Strip `sources` so only role + content are sent to the model.
-      ...history
-        .slice(-MAX_HISTORY_MESSAGES)
-        .map(({ role, content }) => ({ role, content })),
+      ...history.map(({ role, content }) => ({ role, content })),
       { role: 'user', content: promptForModel },
     ];
 
@@ -141,7 +207,12 @@ export class ChatService {
     // request doesn't leave a question without an answer in the history.
     // We store the plain question, not the big prompt with the sources in it,
     // so the history stays small. Each new question retrieves fresh sources.
-    this.saveTurn(conversationId, userMessage, fullReply, sources);
+    await this.store.appendTurn(
+      conversationId,
+      userMessage,
+      fullReply,
+      sources,
+    );
   }
 
   /** Finds the chunks relevant to the question, renumbered 1, 2, 3… */
@@ -152,20 +223,6 @@ export class ChatService {
       .filter((s) => s.score >= this.minScore)
       .filter((s) => s.score >= best - MAX_SCORE_GAP_FROM_BEST)
       .map((s, i) => ({ ...s, n: i + 1 }));
-  }
-
-  private saveTurn(
-    conversationId: string,
-    question: string,
-    answer: string,
-    sources?: Source[],
-  ) {
-    this.store.append(conversationId, { role: 'user', content: question });
-    this.store.append(conversationId, {
-      role: 'assistant',
-      content: answer,
-      sources,
-    });
   }
 }
 

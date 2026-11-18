@@ -1,12 +1,8 @@
 import {
   Body,
   Controller,
-  Delete,
-  Get,
-  HttpCode,
   HttpException,
   Logger,
-  Param,
   Post,
   Res,
 } from '@nestjs/common';
@@ -36,6 +32,9 @@ import { ChatRequestDto } from './dto/chat-request.dto';
  *   event: done
  *   data: {}
  *
+ *   event: title                        (after the first answer of a new chat)
+ *   data: {"title":"Annual leave policy"}
+ *
  * or `event: error` / `data: {"message":"..."}` if something goes wrong mid-stream.
  *
  * (The browser's built-in EventSource only supports GET, so the frontend reads
@@ -49,8 +48,6 @@ export class ChatController {
 
   @Post()
   async send(@Body() body: ChatRequestDto, @Res() res: Response) {
-    const conversationId = this.chat.resolveConversation(body.conversationId);
-
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -66,8 +63,13 @@ export class ChatController {
       if (!res.writableEnded) abort.abort();
     });
 
-    send('meta', { conversationId });
     try {
+      const conversationId = await this.chat.resolveConversation(
+        body.conversationId,
+        body.message,
+      );
+      send('meta', { conversationId });
+
       for await (const event of this.chat.reply(conversationId, body.message, {
         useDocuments: body.useDocuments ?? false,
         temperature: body.temperature,
@@ -77,7 +79,14 @@ export class ChatController {
           send('sources', { sources: event.sources });
         else send('token', { content: event.content });
       }
+      // "done" first, so the UI can unlock the input right away...
       send('done');
+
+      // ...then, for a new chat, name it (takes a second or two on CPU).
+      if (!abort.signal.aborted) {
+        const title = await this.chat.generateTitleIfNeeded(conversationId);
+        if (title) send('title', { title });
+      }
     } catch (err) {
       if (!abort.signal.aborted) {
         send('error', { message: friendlyMessage(err, this.logger) });
@@ -85,17 +94,6 @@ export class ChatController {
     } finally {
       res.end();
     }
-  }
-
-  @Get(':conversationId')
-  history(@Param('conversationId') conversationId: string) {
-    return { conversationId, messages: this.chat.getHistory(conversationId) };
-  }
-
-  @Delete(':conversationId')
-  @HttpCode(204)
-  reset(@Param('conversationId') conversationId: string) {
-    this.chat.reset(conversationId);
   }
 }
 

@@ -55,6 +55,28 @@ const SCHEMA_SQL = `
 
   -- DOCX files and web pages have no page numbers.
   ALTER TABLE chunks ALTER COLUMN page DROP NOT NULL;
+
+  -- Chat history (the ChatGPT-style sidebar).
+  CREATE TABLE IF NOT EXISTS conversations (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    title       TEXT        NOT NULL,
+    -- false while the title is just the start of the first question;
+    -- true once the LLM has named the chat or the user renamed it.
+    title_final BOOLEAN     NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS conversations_updated_idx ON conversations (updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS messages (
+    id              BIGSERIAL   PRIMARY KEY,
+    conversation_id UUID        NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT        NOT NULL CHECK (role IN ('user', 'assistant')),
+    content         TEXT        NOT NULL,
+    sources         JSONB,      -- RAG answers: the chunks behind [1], [2]…
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages (conversation_id, id);
 `;
 
 @Injectable()
