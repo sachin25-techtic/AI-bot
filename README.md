@@ -65,8 +65,3 @@ A re-upload with the same name replaces the old chunks. If the text hasn't chang
 | GET / DELETE | `/api/documents[/:id]` | List and delete documents |
 | GET | `/api/health` | Status of Ollama, the models and the database |
 
-## Limitations
-
-- No user accounts: everyone shares the same chats and documents.
-- Scanned PDFs need OCR first.
-- Large uploads are processed during the request, not in a background job.
